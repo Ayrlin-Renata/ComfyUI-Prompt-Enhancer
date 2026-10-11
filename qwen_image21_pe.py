@@ -1964,3 +1964,131 @@ class QwenImage21PromptEnhancer:
                 f"[Qwen Image 2.1 PE] 解析成功，画布："
                 f"{parsed['wh_ratio'] or parsed['ratio_follow'] or '未指定'}"
             )
+
+
+class QwenImage21PromptEnhancerList(QwenImage21PromptEnhancer):
+    """List-input version of the Qwen-Image-2.1 prompt enhancer.
+
+    Feed a list of prompts into this node. It enhances each prompt while
+    keeping the PE model resident for the whole batch, then unloads once
+    at the end if the loader's unload switch is enabled.
+    """
+
+    INPUT_IS_LIST = True
+    FUNCTION = "enhance_list"
+    CATEGORY = "Prompt Enhancer"
+    DESCRIPTION = (
+        "List-input version of the Qwen-Image-2.1 prompt enhancer. "
+        "Feed a list of prompts; outputs a flat list of enhanced prompts. "
+        "Keeps the PE model loaded for the whole list and unloads once at "
+        "the end if the loader's unload switch is on."
+    )
+
+    @classmethod
+    def IS_CHANGED(cls, **inputs):
+        """Seed handling for list-mode inputs."""
+        try:
+            seed = int(_scalar(inputs.get("Seed"), -1))
+        except (TypeError, ValueError):
+            seed = -1
+        return time.time_ns() if seed < 0 else seed
+
+    def enhance_list(self, **inputs):
+        prompts = _as_text_list(inputs.get("Prompt"))
+        if not prompts:
+            raise ValueError("Prompt list cannot be empty.")
+
+        # With INPUT_IS_LIST=True, linked/widget values may arrive as lists.
+        # Unwrap everything except the main prompt list.
+        base_inputs = {}
+        for key, value in inputs.items():
+            if key == "Prompt":
+                continue
+
+            # NOTE:
+            # This simple version takes the first connected image per image socket.
+            # That is fine for text-only enhancement or one shared reference image.
+            # Per-prompt reference images would require extra logic.
+            base_inputs[key] = _scalar(value)
+
+        enhancement_enabled = bool(base_inputs.get("Prompt Enhancement", True))
+
+        # Bypass mode: return the prompts unchanged.
+        if not enhancement_enabled:
+            rows = []
+            for prompt in prompts:
+                item_inputs = dict(base_inputs)
+                item_inputs["Prompt"] = prompt
+
+                # _bypass returns tuple-of-one-item-lists.
+                out = self._bypass(item_inputs)
+                rows.append(tuple(out[i][0] for i in range(6)))
+
+            return tuple([row[i] for row in rows] for i in range(6))
+
+        model = base_inputs.get("pe_model")
+        if not model:
+            raise ValueError(
+                "请连接“Qwen Image 2.1 PE Loader”：本节点只负责扩写，"
+                "权重、上下文和 clip 都在那个加载节点上选。"
+            )
+
+        try:
+            count = max(1, int(base_inputs.get("Prompt Count", 1) or 1))
+        except Exception:
+            count = 1
+
+        try:
+            seed_input = int(base_inputs.get("Seed", 42) or 42)
+        except Exception:
+            seed_input = 42
+
+        if seed_input < 0:
+            seed_input = random.SystemRandom().randint(0, 0xFFFFFFFF)
+
+        total = len(prompts) * count
+        rows = []
+        global_index = 0
+
+        try:
+            for prompt in prompts:
+                item_inputs = dict(base_inputs)
+                item_inputs["Prompt"] = prompt
+
+                for variant in range(count):
+                    row_seed = (seed_input + global_index) & 0xFFFFFFFF
+
+                    # Important:
+                    # Pass is_last=False so _enhance_one does not unload
+                    # after every single prompt. We unload once below.
+                    rows.append(
+                        self._enhance_one(
+                            variant,
+                            row_seed,
+                            False,
+                            **item_inputs
+                        )
+                    )
+
+                    global_index += 1
+
+        finally:
+            # Unload once after the whole list has been processed.
+            # This is the important part for GGUF/VRAM safety.
+            if bool(model.get("unload", True)):
+                try:
+                    _VisionRuntime.close()
+                except Exception:
+                    pass
+
+                try:
+                    _release_encoder()
+                except Exception:
+                    pass
+
+                try:
+                    gc.collect()
+                except Exception:
+                    pass
+
+        return tuple([row[i] for row in rows] for i in range(6))
